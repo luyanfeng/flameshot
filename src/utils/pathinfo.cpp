@@ -23,9 +23,14 @@ QStringList PathInfo::translationsPaths()
       QFileInfo(qApp->applicationDirPath()).absoluteFilePath();
     QString trPath = QDir::toNativeSeparators(binaryPath + "/translations");
 #if defined(Q_OS_UNIX)
+    // Relocatable installs (e.g. AppImage) keep the binary in <prefix>/bin and
+    // the translations in <prefix>/share/flameshot/translations.
+    QString relocatableTrPath = QDir::toNativeSeparators(
+      QDir::cleanPath(binaryPath + "/../share/flameshot/translations"));
     return QStringList()
            << QStringLiteral(APP_PREFIX) + "/share/flameshot/translations"
-           << trPath << QStringLiteral("/usr/share/flameshot/translations")
+           << relocatableTrPath << trPath
+           << QStringLiteral("/usr/share/flameshot/translations")
            << QStringLiteral("/usr/local/share/flameshot/translations");
 #endif
     return QStringList() << trPath;
