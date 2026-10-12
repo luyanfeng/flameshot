@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: ["Packaging(Linux)", "Packaging(Windows)"]
+    types: [completed]
+    branches:
+      - master
+      - fix*
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-release:
+    name: Collect artifacts and publish Release
+    # workflow_run 触发时，只有上游成功才继续；手动触发时直接运行
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Compute version info
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 优先取上游 workflow run 的提交，手动触发用当前 checkout 的 sha
+          SHA="${{ github.event.workflow_run.head_sha || github.sha }}"
+          SHORT_SHA=$(git rev-parse --short "$SHA")
+
+          # 版本号规则与打包 workflow 一致：取最近 tag，去掉 v 前缀
+          LAST_TAG=$(git tag -l --sort=-v:refname | head -1)
+          VERSION="${LAST_TAG#v}"
+
+          REVNO=$(git rev-list "${LAST_TAG}..${SHA}" --count)
+          VER_INFO="${VERSION}+git${REVNO}.${SHORT_SHA}"
+
+          echo "version=${VERSION}"      >> "$GITHUB_OUTPUT"
+          echo "ver_info=${VER_INFO}"    >> "$GITHUB_OUTPUT"
+          echo "sha=${SHA}"              >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}"  >> "$GITHUB_OUTPUT"
+          echo "VERSION=${VERSION} VER_INFO=${VER_INFO} SHA=${SHA}"
+
+      - name: Download all artifacts of this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.ver.outputs.sha }}"
+          mkdir -p dist
+          # 拉取两个打包 workflow 最近一次运行中、与该 commit 匹配的全部 artifacts
+          for WF in "Packaging(Linux)" "Packaging(Windows)"; do
+            RUN_ID=$(gh run list -R "${GITHUB_REPOSITORY}" \
+              --workflow="$WF" --status success --limit 20 \
+              --json databaseId,headSha \
+              -q ".[] | select(.headSha==\"$SHA\") | .databaseId" | head -1)
+            if [ -z "$RUN_ID" ]; then
+              echo "WARNING: no successful run of '$WF' for $SHA, skip"
+              continue
+            fi
+            echo "Downloading artifacts of $WF run $RUN_ID"
+            gh run download "$RUN_ID" -R "${GITHUB_REPOSITORY}" -D dist_raw || true
+          done
+          # 展平目录结构（gh run download 会按 artifact 名建目录）
+          find dist_raw -type f -print0 | while IFS= read -r -d '' f; do
+            cp -v "$f" dist/
+          done
+          echo "=== dist 内容 ==="
+          ls -la dist/
+
+      - name: Verify required artifacts present
+        run: |
+          set -euo pipefail
+          cd dist
+          echo "=== 产物清单 ==="
+          ls -la
+          # 校验用户要求的关键产物是否齐全（ubuntu 24.04/26.04、debian13、appimage、win）
+          for pat in \
+            "*ubuntu-24.04.amd64.deb" \
+            "*ubuntu-24.04.arm64.deb" \
+            "*ubuntu-26.04.amd64.deb" \
+            "*ubuntu-26.04.arm64.deb" \
+            "*debian-13.amd64.deb" \
+            "*.x86_64.AppImage" \
+            "*-win64.msi" \
+            "*-win64.zip"; do
+            count=$(ls $pat 2>/dev/null | wc -l)
+            if [ "$count" -eq 0 ]; then
+              echo "WARNING: 缺少 $pat"
+            else
+              echo "OK: $pat ($count)"
+            fi
+          done
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          VER_INFO: ${{ steps.ver.outputs.ver_info }}
+          SHORT_SHA: ${{ steps.ver.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          TAG="v${VER_INFO}"
+          TITLE="Flameshot ${TAG}"
+
+          NOTES=$(cat <<'EON'
+          ## Downloads
+
+          ### Linux
+          - **Ubuntu 24.04 / 26.04** (amd64 / arm64): `flameshot-*.ubuntu-24.04.*.deb`, `flameshot-*.ubuntu-26.04.*.deb`
+          - **Debian 13**: `flameshot-*.debian-13.*.deb`
+          - **AppImage** (x86_64, 捆绑 Qt 翻译): `Flameshot-*.x86_64.AppImage`
+          - Fedora rpm / snap / flatpak: 见对应产物
+
+          ### Windows 10 / 11 (x64)
+          - **安装包 (MSI)**: `Flameshot-*-win64.msi`
+          - **便携版 (ZIP)**: `flameshot-*-win64.zip`
+
+          校验：每个包附带 `.sha256sum`。
+
+          本构建包含以下分支修复：
+          - GNOME Wayland mixed-DPI 截图重复缩放修复
+          - `-p` 参数下 pin 按钮误隐藏修复
+          - AppImage 翻译路径修复（AppImage 自带中文，含 Qt 官方翻译）
+          EON
+          )
+
+          # 若 release 已存在则删除重建，保证幂等（同 commit 重跑）
+          if gh release view "$TAG" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，删除后重建（幂等）"
+            gh release delete "$TAG" -R "${GITHUB_REPOSITORY}" --yes --cleanup-tag
+          fi
+
+          gh release create "$TAG" \
+            -R "${GITHUB_REPOSITORY}" \
+            --target "${SHORT_SHA}" \
+            --title "$TITLE" \
+            --notes "$NOTES" \
+            dist/*
+
+          echo "=== Release $TAG 发布完成 ==="
+          gh release view "$TAG" -R "${GITHUB_REPOSITORY}"
