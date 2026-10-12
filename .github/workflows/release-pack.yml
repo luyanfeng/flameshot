@@ -57,7 +57,20 @@ jobs:
           set -euo pipefail
           SHA="${{ steps.ver.outputs.sha }}"
           mkdir -p dist
-          # 拉取两个打包 workflow 最近一次运行中、与该 commit 匹配的全部 artifacts
+          # 等待该 commit 的两个打包 workflow 全部出结果（Windows 先完成时 Linux 可能仍在跑）
+          for i in $(seq 1 60); do
+            PENDING=$(gh run list -R "${GITHUB_REPOSITORY}" \
+              --workflow="Packaging(Linux)" --workflow="Packaging(Windows)" \
+              --commit "$SHA" --json status \
+              -q '[.[] | select(.status!="completed")] | length' 2>/dev/null || echo 0)
+            [ "$PENDING" = "0" ] && break
+            echo "还有 $PENDING 个打包 run 未完成，等待 60s..."
+            sleep 60
+          done
+
+          # 下载该 commit 已成功 run 的全部 artifacts（Linux 为必需，Windows 为必需，
+          # flatpak/snap 因源码写死上游 repo 在 fork 上可能失败，缺失可容忍）
+          ok=false
           for WF in "Packaging(Linux)" "Packaging(Windows)"; do
             RUN_ID=$(gh run list -R "${GITHUB_REPOSITORY}" \
               --workflow="$WF" --status success --limit 20 \
@@ -69,7 +82,9 @@ jobs:
             fi
             echo "Downloading artifacts of $WF run $RUN_ID"
             gh run download "$RUN_ID" -R "${GITHUB_REPOSITORY}" -D dist_raw || true
+            ok=true
           done
+          [ "$ok" = "true" ] || { echo "没有任何成功的打包 run"; exit 1; }
           # 展平目录结构（gh run download 会按 artifact 名建目录）
           find dist_raw -type f -print0 | while IFS= read -r -d '' f; do
             cp -v "$f" dist/
@@ -84,6 +99,7 @@ jobs:
           echo "=== 产物清单 ==="
           ls -la
           # 校验用户要求的关键产物是否齐全（ubuntu 24.04/26.04、debian13、appimage、win）
+          missing=0
           for pat in \
             "*ubuntu-24.04.amd64.deb" \
             "*ubuntu-24.04.arm64.deb" \
@@ -96,10 +112,16 @@ jobs:
             count=$(ls $pat 2>/dev/null | wc -l)
             if [ "$count" -eq 0 ]; then
               echo "WARNING: 缺少 $pat"
+              missing=$((missing+1))
             else
               echo "OK: $pat ($count)"
             fi
           done
+          # 核心产物（Linux deb + AppImage + Windows）缺一个即失败
+          if [ "$missing" -gt 0 ]; then
+            echo "ERROR: 有 $missing 类核心产物缺失"
+            exit 1
+          fi
 
       - name: Publish Release
         env:
