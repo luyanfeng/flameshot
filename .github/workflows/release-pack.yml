@@ -150,6 +150,7 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
           VER_INFO: ${{ steps.ver.outputs.ver_info }}
           SHORT_SHA: ${{ steps.ver.outputs.short_sha }}
+          SHA: ${{ steps.ver.outputs.sha }}
         run: |
           set -euo pipefail
           TAG="v${VER_INFO}"
