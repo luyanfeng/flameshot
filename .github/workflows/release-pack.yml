@@ -185,7 +185,7 @@ jobs:
 
           gh release create "$TAG" \
             -R "${GITHUB_REPOSITORY}" \
-            --target "${SHORT_SHA}" \
+            --target "${SHA}" \
             --title "$TITLE" \
             --notes "$NOTES" \
             dist/*
